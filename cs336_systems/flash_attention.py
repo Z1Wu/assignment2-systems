@@ -24,8 +24,8 @@ class FlashAttentionPytorch(torch.autograd.Function):
         O = torch.empty_like(Q, device=device)
         L = torch.empty((dim_batch, dim_seq, 1), device=device)
         
-        b_q = 4
-        b_k = 4
+        b_q = 16
+        b_k = 16
         t_q = math.ceil(dim_seq / b_q)
         t_k = math.ceil(dim_seq / b_k)
 
@@ -45,8 +45,8 @@ class FlashAttentionPytorch(torch.autograd.Function):
                         ul_j = (j - 1) * b_k
                         col_idx = torch.arange(ul_j, ul_j + b_k).view(1, b_k)
                         row_idx = torch.arange(ul_i, ul_i + b_q).view(b_q, 1)
-                        mask = row_idx <= col_idx
-                        S_i[mask] = float('-inf')
+                        mask = row_idx < col_idx
+                        S_i[mask] -= 1e6
                     
                     m_i_1 = torch.max(torch.cat([m_i, S_i], dim = 1), dim=1, keepdim=True).values
                     P_i = torch.exp(S_i - m_i_1) # broacast here
@@ -79,6 +79,7 @@ def flash_fwd_kernel(
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
+    is_causal: tl.constexpr
 ):
     # Program indices
     query_tile_index = tl.program_id(0)
@@ -130,25 +131,38 @@ def flash_fwd_kernel(
         strides=(stride_lq, 1),
         offsets=(query_tile_index * Q_TILE_SIZE, 0),
         block_shape=(Q_TILE_SIZE, 1),
-        order=(0),
+        order=(1, 0)
     )
 
     Q_i = tl.load(Q_block_ptr, boundary_check=(0, 1),padding_option="zero") # [Q_TILE_SIZE, D]
     O_i = tl.zeros((Q_TILE_SIZE, D), dtype = tl.float32)
     l_i = tl.zeros((Q_TILE_SIZE, 1), dtype = tl.float32)
-    m_i = tl.zeros((Q_TILE_SIZE, 1), dtype = tl.float32)
-    for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+    m_i = tl.full((Q_TILE_SIZE, 1), float('-inf'), dtype = tl.float32)
+    for j in range(tl.cdiv(stride_kb // D, K_TILE_SIZE)):
         K_j = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero") # [K_TILE_SIZE, D]
-        V_j = tl.load(V_block_ptr, boundary_check=(0,),padding_option="zero") # [K_TILE_SIZE, D]
-        S_i = tl.dot(Q_i, tl.dot(K_j)) / scale
-        m_i_1 = tl.max(tl.cat(m_i, S_i), axis = 1, keep_dims=True)
+        V_j = tl.load(V_block_ptr, boundary_check=(0, 1),padding_option="zero") # [K_TILE_SIZE, D]
+        S_i = tl.dot(Q_i, tl.trans(K_j)) / scale
+            
+        m_i_1 = tl.maximum(
+            m_i, # [Q_TILE_SIZE, 1]
+            tl.max(S_i, axis=1, keep_dims=True) # [Q_TILE_SIZE, 1]
+        )
+        if is_causal:
+            col_offs = j * K_TILE_SIZE
+            row_offs = query_tile_index * Q_TILE_SIZE
+            col_idx = (tl.arange(0, K_TILE_SIZE) + col_offs).view(1, K_TILE_SIZE)
+            row_idx = (tl.arange(0, Q_TILE_SIZE) + row_offs).view(Q_TILE_SIZE, 1)
+            mask = row_idx < col_idx
+            S_i -= mask * (1e6)
         P_i = tl.exp(S_i - m_i_1)
-        l_i = tl.exp(m_i - m_i_1) * l_i + tl.sum(P_i, dim=1, keep_dims=True)
+        l_i = tl.exp(m_i - m_i_1) * l_i + tl.sum(P_i, axis=1, keep_dims=True)
         O_i = tl.exp(m_i - m_i_1) * O_i + tl.dot(P_i.to(V_j.dtype), V_j)
         m_i = m_i_1
-        K_block_ptr.advance((K_TILE_SIZE, 0))
-        V_block_ptr.advance((K_TILE_SIZE, 0))
+        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
 
+    # tl.device_print('b_i: ', batch_index)
+    # tl.device_print(f'l_i: shape[1]', int(l_i.shape[0]))
     O_i = O_i / l_i
     L_i = m_i + tl.log(l_i)
     tl.store(
@@ -184,10 +198,11 @@ class FlashAttentionTriton(torch.autograd.Function):
         O = torch.empty_like(Q, device=device)
         L = torch.empty((n_query, 1), device=device)
 
-        K_TILE_SIZE = 4
-        Q_TILE_SIZE = 4
-
-        flash_fwd_kernel[(triton.cdiv(Q_TILE_SIZE, dim_batch),)](
+        K_TILE_SIZE = 16
+        Q_TILE_SIZE = 16
+        lauch_grid = (triton.cdiv(dim_seq_q, Q_TILE_SIZE), dim_batch)
+        print('triton launch grid: ', lauch_grid)
+        flash_fwd_kernel[lauch_grid](
             Q, K, V,
             O, L,
             dim_seq_q * dim_d, dim_d, 1, # Q
@@ -200,26 +215,47 @@ class FlashAttentionTriton(torch.autograd.Function):
             D = dim_d, # type: ignore
             Q_TILE_SIZE = Q_TILE_SIZE, # type: ignore
             K_TILE_SIZE = K_TILE_SIZE, # type: ignore
+            is_causal = is_causal # type: ignore
         )
-        return einops.rearrange(O, '(...) d -> b seq d', b = dim_batch, seq = dim_seq_q)
+        ctx.save_for_backward(L.reshape(dim_batch, dim_seq_q))
+        ctx.is_causal = is_causal
+        return einops.rearrange(O, '(b seq) d -> b seq d', b = dim_batch, seq = dim_seq_q)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        raise NotImplemented
 
 
+# @triton.jit
+# def kernel():
+#     # t = tl.zeros((2, 1), dtype=tl.float32)
+#     # tl.device_print('test', t)
+#     # import pdb
+#     # pdb.set_trace()
+#     tl.device_print('test', tl.program_id(1))
 
 if __name__ == "__main__":
+    # kernel[(4,)]()
+    # exit()
+
     def _make_attn_inputs(device=None):
         torch.random.manual_seed(0)
-        batch_size = 1
-        n_queries = 8
-        n_keys = 8
-        D = 4
+        batch_size = 2
+        n_queries = 32
+        n_keys = 32
+        D = 16
         q = torch.randn(batch_size, n_queries, D, device=device, requires_grad=True)
         k = torch.randn(batch_size, n_keys, D, device=device, requires_grad=True)
         v = torch.randn(batch_size, n_keys, D, device=device, requires_grad=True)
         do = torch.randn(batch_size, n_queries, D, device=device)
-
         return q, k, v, do
     
     q, k, v, do = _make_attn_inputs('cuda')
-    f = FlashAttentionPytorch.apply
-    out = f(q, k, v, False)
-    print(out)
+    f1 = FlashAttentionPytorch.apply
+    out1 = f1(q, k, v, True)
+
+    f2 = FlashAttentionTriton.apply
+    out2 = f2(q, k, v, True)
+
+    print(out1[0][0]) # type: ignore
+    print(out2[0][0]) # type: ignore
