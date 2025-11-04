@@ -58,12 +58,28 @@ class FlashAttentionPytorch(torch.autograd.Function):
                 L_i = m_i + torch.log(l_i)
                 O[b, (i - 1) * b_q: i * b_q, :] = O_i
                 L[b, (i - 1) * b_q: i * b_q, :] = L_i
-        ctx.save_for_backward(L.reshape(dim_batch, dim_seq))
+        # Q,K,V => [b, seq, d]
+        # L => [b, seq]
+        ctx.save_for_backward(Q, K, V, O, L.reshape(dim_batch, dim_seq))
+        ctx.sqrt_d = sqrt_dim_d
+        ctx.is_causal = is_causal
         return O
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        raise NotImplemented
+    def backward(ctx, dO: torch.Tensor):
+        Q, K, V, O, L = ctx.saved_tensors
+        # b, seq, dim = Q.shape
+        sqrt_dim_d = ctx.sqrt_d
+        D = torch.sum(O * dO, dim = -1, keepdim = True)
+        S = einops.einsum(Q, K, 'b seq_q dim, b seq_k dim -> b seq_q seq_k') / sqrt_dim_d
+        L = einops.rearrange(L, '... -> ... 1')
+        P = torch.exp(S - L)
+        dV = einops.einsum(P, dO, 'b seq_q seq_k, b seq_q dim_d -> b seq_k dim_d')
+        dP = einops.einsum(dO, V, 'b seq_q dim_d, b seq_k dim_d -> b seq_q seq_k')
+        dS = P * (dP - D)
+        dQ = einops.einsum(dS, K, 'b seq_q seq_k, b seq_k dim_d -> b seq_q dim_d') / sqrt_dim_d 
+        dK = einops.einsum(dS, Q, 'b seq_q seq_k, b seq_q dim_d -> b seq_k dim_d') / sqrt_dim_d
+        return dQ, dK, dV, None
 
 @triton.jit
 def flash_fwd_kernel(
@@ -253,9 +269,10 @@ if __name__ == "__main__":
     q, k, v, do = _make_attn_inputs('cuda')
     f1 = FlashAttentionPytorch.apply
     out1 = f1(q, k, v, True)
+    out1.backward(torch.ones(out1.shape).cuda()) # type: ignore
 
-    f2 = FlashAttentionTriton.apply
-    out2 = f2(q, k, v, True)
+    # f2 = FlashAttentionTriton.apply
+    # out2 = f2(q, k, v, True)
 
-    print(out1[0][0]) # type: ignore
-    print(out2[0][0]) # type: ignore
+    # print(out1[0][0]) # type: ignore
+    # print(out2[0][0]) # type: ignore
