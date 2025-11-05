@@ -3,6 +3,7 @@ import einops
 import math
 import triton.language as tl
 import triton
+import torch.nn.functional as F
 
 
 class FlashAttentionPytorch(torch.autograd.Function):
@@ -23,6 +24,7 @@ class FlashAttentionPytorch(torch.autograd.Function):
         dim_seq = Q.shape[-2]
         O = torch.empty_like(Q, device=device)
         L = torch.empty((dim_batch, dim_seq, 1), device=device)
+        dtype = Q.dtype
         
         b_q = 16
         b_k = 16
@@ -32,9 +34,9 @@ class FlashAttentionPytorch(torch.autograd.Function):
         for b in range(dim_batch):
             for i in range(1, t_q + 1):
                 Q_i = Q[b, (i - 1) * b_q: i * b_q, :]
-                O_i = torch.zeros((b_q, dim_d), device=device)
-                l_i = torch.zeros((b_q, 1), device=device)
-                m_i = torch.ones((b_q, 1), device=device) * float('-inf')
+                O_i = torch.zeros((b_q, dim_d), device=device, dtype=dtype)
+                l_i = torch.zeros((b_q, 1), device=device, dtype=dtype)
+                m_i = torch.ones((b_q, 1), device=device, dtype=dtype) * float('-inf')
                 for j in range(1, t_k + 1):
                     K_j = K[b, (j - 1) * b_k: j * b_k, :] # [b_k, d]
                     V_j = V[b, (j - 1) * b_k: j * b_k, :] # [b_k, d]
@@ -195,6 +197,7 @@ def flash_fwd_kernel(
 
 
 class FlashAttentionTriton(torch.autograd.Function):
+
     @staticmethod
     def forward(ctx, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, is_causal=False):
         dim_d = Q.shape[-1]
@@ -217,7 +220,7 @@ class FlashAttentionTriton(torch.autograd.Function):
         K_TILE_SIZE = 16
         Q_TILE_SIZE = 16
         lauch_grid = (triton.cdiv(dim_seq_q, Q_TILE_SIZE), dim_batch)
-        print('triton launch grid: ', lauch_grid)
+        # print('triton launch grid: ', lauch_grid)
         flash_fwd_kernel[lauch_grid](
             Q, K, V,
             O, L,
@@ -245,69 +248,137 @@ class FlashAttentionTriton(torch.autograd.Function):
         return einops.rearrange(O, '(b seq) d -> b seq d', b = dim_batch, seq = dim_seq_q)
 
     @staticmethod
+    @torch.compile
     def backward(ctx, dO: torch.Tensor):
-        def func(ctx, dO: torch.Tensor):
-            Q, K, V, O, L = ctx.saved_tensors
-            dim_seq_q = Q.shape[-2]
-            dim_seq_k = K.shape[-2]
-            device = Q.device
-            # b, seq, dim = Q.shape
-            scale = ctx.scale
-            is_causal = ctx.is_causal
-            D = torch.sum(O * dO, dim = -1, keepdim = True)
-            S = einops.einsum(Q, K, 'b seq_q dim, b seq_k dim -> b seq_q seq_k') / scale
-            if is_causal:
-                # dim_seq_q, dim_seq_k
-                ctx.mask = einops.rearrange(
-                    torch.arange(dim_seq_q).reshape((-1, 1)) >= torch.arange(dim_seq_k).reshape((1, -1)),
-                    '... -> 1 ...'
-                ).to(device)
-                # dim_batch, dim_seq_q, dim_seq_k
-                S = torch.where(ctx.mask, S, float('-inf'))
-            L = einops.rearrange(L, '... -> ... 1')
-            P = torch.exp(S - L)
-            dV = einops.einsum(P, dO, 'b seq_q seq_k, b seq_q dim_d -> b seq_k dim_d')
-            dP = einops.einsum(dO, V, 'b seq_q dim_d, b seq_k dim_d -> b seq_q seq_k')
-            dS = P * (dP - D)
-            dQ = einops.einsum(dS, K, 'b seq_q seq_k, b seq_k dim_d -> b seq_q dim_d') / scale 
-            dK = einops.einsum(dS, Q, 'b seq_q seq_k, b seq_q dim_d -> b seq_k dim_d') / scale
-            return dQ, dK, dV, None
+        Q, K, V, O, L = ctx.saved_tensors
+        dim_seq_q = Q.shape[-2]
+        dim_seq_k = K.shape[-2]
+        device = Q.device
+        # b, seq, dim = Q.shape
+        scale = ctx.scale
+        is_causal = ctx.is_causal
+        D = torch.sum(O * dO, dim = -1, keepdim = True)
+        S = einops.einsum(Q, K, 'b seq_q dim, b seq_k dim -> b seq_q seq_k') / scale
+        if is_causal:
+            # dim_seq_q, dim_seq_k
+            ctx.mask = einops.rearrange(
+                torch.arange(dim_seq_q).reshape((-1, 1)) >= torch.arange(dim_seq_k).reshape((1, -1)),
+                '... -> 1 ...'
+            ).to(device)
+            # dim_batch, dim_seq_q, dim_seq_k
+            S = torch.where(ctx.mask, S, float('-inf'))
+        L = einops.rearrange(L, '... -> ... 1')
+        P = torch.exp(S - L)
+        dV = einops.einsum(P, dO, 'b seq_q seq_k, b seq_q dim_d -> b seq_k dim_d')
+        dP = einops.einsum(dO, V, 'b seq_q dim_d, b seq_k dim_d -> b seq_q seq_k')
+        dS = P * (dP - D)
+        dQ = einops.einsum(dS, K, 'b seq_q seq_k, b seq_k dim_d -> b seq_q dim_d') / scale 
+        dK = einops.einsum(dS, Q, 'b seq_q seq_k, b seq_q dim_d -> b seq_k dim_d') / scale
+        return dQ, dK, dV, None
 
-        compiled_func = torch.compile(func)
-        return compiled_func(ctx, dO)
+def _get_torch_dtype_from_str(dtype_str: str):
+    if dtype_str == 'float32':
+        return torch.float32
+    elif dtype_str == 'float16':
+        return torch.float16
+    elif dtype_str == 'bfloat16':
+        return torch.bfloat16
+    else:
+        raise ValueError('invalid dtype str:', dtype_str)
 
-# @triton.jit
-# def kernel():
-#     # t = tl.zeros((2, 1), dtype=tl.float32)
-#     # tl.device_print('test', t)
-#     # import pdb
-#     # pdb.set_trace()
-#     tl.device_print('test', tl.program_id(1))
+def _make_attn_inputs(batch_size, n_queries, n_keys, D, device=None, dtype = None):
+    torch.random.manual_seed(0)
+    q = torch.randn(batch_size, n_queries, D, device=device, requires_grad=True, dtype=dtype)
+    k = torch.randn(batch_size, n_keys, D, device=device, requires_grad=True,dtype=dtype)
+    v = torch.randn(batch_size, n_keys, D, device=device, requires_grad=True,dtype=dtype)
+    do = torch.randn(batch_size, n_queries, D, device=device, dtype=dtype)
+    return q, k, v, do
+
+def benchmark():
+
+    # D_list = (16, 32, 64, 128)
+    D_list = [64, 128]
+    # seq_list = (128, 256, 1024, 2048)
+    seq_list = [1024, 2048]
+    precision_list = ['float32']
+    compile_torch_attn = torch.compile(F.scaled_dot_product_attention)
+    func_list = {
+        'fa_triton': FlashAttentionTriton.apply,
+        'fa_torch': lambda q, k, v, is_causal: compile_torch_attn(q, k, v, is_causal=is_causal)
+    }
+    
+    batch_size = 16
+    warmup_sec = 5
+    running_sec = 10
+    res_list = []
+    for D in D_list:
+        for seq_len in seq_list:
+            for precision in precision_list:
+                for func_name, func in func_list.items(): 
+                    q, k, v, do = _make_attn_inputs(batch_size, seq_len, seq_len, D, 'cuda', _get_torch_dtype_from_str(precision))
+                    
+                    forward_mean_ms = triton.testing.do_bench(
+                        lambda : func(q, k, v, True),
+                        warmup= warmup_sec * 1000,
+                        rep = running_sec * 1000
+                    )
+                    
+                    @torch.compile
+                    def _backward_iter():
+                        func(q, k, v, True).backward(do)
+                    backward_and_forward_mean_ms = triton.testing.do_bench(
+                        lambda : _backward_iter(),
+                        warmup= warmup_sec * 1000,
+                        rep = running_sec * 1000
+                    )
+                    res_line = {
+                        'D': D,
+                        'seq_len': seq_len,
+                        'dtype': precision,
+                        'func_name': func_name,
+                        'forward_mean_ms': forward_mean_ms,
+                        'backward_and_forward_mean_ms': backward_and_forward_mean_ms,
+                    }
+                    print(res_line)
+                    res_list.append(res_line)
+    
+    import pandas as pd
+    import datetime
+    print(res_list)
+    pd.DataFrame(res_list).to_excel(f'out_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx')
 
 if __name__ == "__main__":
-    # kernel[(4,)]()
-    # exit()
-
-    def _make_attn_inputs(device=None):
-        torch.random.manual_seed(0)
-        batch_size = 2
-        n_queries = 32
-        n_keys = 32
-        D = 16
-        q = torch.randn(batch_size, n_queries, D, device=device, requires_grad=True)
-        k = torch.randn(batch_size, n_keys, D, device=device, requires_grad=True)
-        v = torch.randn(batch_size, n_keys, D, device=device, requires_grad=True)
-        do = torch.randn(batch_size, n_queries, D, device=device)
-        return q, k, v, do
-    
-    q, k, v, do = _make_attn_inputs('cuda')
+    benchmark()
+    exit()
+    batch_size, n_queries, n_keys, D = 4, 1024, 1024, 128
+    q, k, v, do = _make_attn_inputs(batch_size, n_queries, n_keys, D, 'cuda')
     # f1 = FlashAttentionPytorch.apply
     # out1 = f1(q, k, v, True)
     # out1.backward(torch.ones(out1.shape).cuda()) # type: ignore
-
+    
     f2 = FlashAttentionTriton.apply
-    out2 = f2(q, k, v, True)
-    out2.backward(torch.ones(out2.shape).cuda()) # type: ignore
+    # out2 = f2(q, k, v, True)
+    # out2.backward(torch.ones(out2.shape).cuda()) # type: ignore
+    # forward
+    out = triton.testing.do_bench(
+        lambda : f2(q, k, v, True),
+        warmup= 5 * 1000,
+        rep = 15 * 1000
+    )
+    print(out)
+
+    # f =  F.scaled_dot_product_attention
+    # # out2 = f2(q, k, v, True)
+    # # out2.backward(torch.ones(out2.shape).cuda()) # type: ignore
+    # # forward
+    # out = triton.testing.do_bench(
+    #     lambda : f(q, k, v, is_causal=True),
+    #     warmup= 5 * 1000,
+    #     rep = 15 * 1000
+    # )
+    # print(out)
 
     # print(out1[0][0]) # type: ignore
     # print(out2[0][0]) # type: ignore
+
+    # F.scaled_dot_product_attention()
