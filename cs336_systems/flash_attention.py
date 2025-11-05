@@ -201,7 +201,7 @@ class FlashAttentionTriton(torch.autograd.Function):
         scale = math.sqrt(dim_d)
         dim_batch = Q.shape[0]
         dim_seq_q = Q.shape[-2]
-        dim_seq_k = Q.shape[-2]
+        dim_seq_k = K.shape[-2]
         device = Q.device
 
         # [b, seq, d]
@@ -233,14 +233,48 @@ class FlashAttentionTriton(torch.autograd.Function):
             K_TILE_SIZE = K_TILE_SIZE, # type: ignore
             is_causal = is_causal # type: ignore
         )
-        ctx.save_for_backward(L.reshape(dim_batch, dim_seq_q))
+        ctx.save_for_backward(
+            Q.reshape(dim_batch, dim_seq_q, dim_d), 
+            K.reshape(dim_batch, dim_seq_k, dim_d),
+            V.reshape(dim_batch, dim_seq_k, dim_d),
+            O.reshape(dim_batch, dim_seq_q, dim_d), 
+            L.reshape(dim_batch, dim_seq_q)
+        )
         ctx.is_causal = is_causal
+        ctx.scale = scale
         return einops.rearrange(O, '(b seq) d -> b seq d', b = dim_batch, seq = dim_seq_q)
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        raise NotImplemented
+    def backward(ctx, dO: torch.Tensor):
+        def func(ctx, dO: torch.Tensor):
+            Q, K, V, O, L = ctx.saved_tensors
+            dim_seq_q = Q.shape[-2]
+            dim_seq_k = K.shape[-2]
+            device = Q.device
+            # b, seq, dim = Q.shape
+            scale = ctx.scale
+            is_causal = ctx.is_causal
+            D = torch.sum(O * dO, dim = -1, keepdim = True)
+            S = einops.einsum(Q, K, 'b seq_q dim, b seq_k dim -> b seq_q seq_k') / scale
+            if is_causal:
+                # dim_seq_q, dim_seq_k
+                ctx.mask = einops.rearrange(
+                    torch.arange(dim_seq_q).reshape((-1, 1)) >= torch.arange(dim_seq_k).reshape((1, -1)),
+                    '... -> 1 ...'
+                ).to(device)
+                # dim_batch, dim_seq_q, dim_seq_k
+                S = torch.where(ctx.mask, S, float('-inf'))
+            L = einops.rearrange(L, '... -> ... 1')
+            P = torch.exp(S - L)
+            dV = einops.einsum(P, dO, 'b seq_q seq_k, b seq_q dim_d -> b seq_k dim_d')
+            dP = einops.einsum(dO, V, 'b seq_q dim_d, b seq_k dim_d -> b seq_q seq_k')
+            dS = P * (dP - D)
+            dQ = einops.einsum(dS, K, 'b seq_q seq_k, b seq_k dim_d -> b seq_q dim_d') / scale 
+            dK = einops.einsum(dS, Q, 'b seq_q seq_k, b seq_q dim_d -> b seq_k dim_d') / scale
+            return dQ, dK, dV, None
 
+        compiled_func = torch.compile(func)
+        return compiled_func(ctx, dO)
 
 # @triton.jit
 # def kernel():
@@ -267,12 +301,13 @@ if __name__ == "__main__":
         return q, k, v, do
     
     q, k, v, do = _make_attn_inputs('cuda')
-    f1 = FlashAttentionPytorch.apply
-    out1 = f1(q, k, v, True)
-    out1.backward(torch.ones(out1.shape).cuda()) # type: ignore
+    # f1 = FlashAttentionPytorch.apply
+    # out1 = f1(q, k, v, True)
+    # out1.backward(torch.ones(out1.shape).cuda()) # type: ignore
 
-    # f2 = FlashAttentionTriton.apply
-    # out2 = f2(q, k, v, True)
+    f2 = FlashAttentionTriton.apply
+    out2 = f2(q, k, v, True)
+    out2.backward(torch.ones(out2.shape).cuda()) # type: ignore
 
     # print(out1[0][0]) # type: ignore
     # print(out2[0][0]) # type: ignore
