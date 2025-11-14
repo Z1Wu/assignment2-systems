@@ -467,32 +467,32 @@ if __name__ == '__main__':
     # test_simple_attention_layer()
 
 
-    # model_benchmark(
-    #     with_backward=True,
-    #     model_config= {
-    #         'name': 'BasicsTransformerLM',
-    #         'device': 'cuda',
-    #         'torch_compile': True,
-    #         **test_configs['medium'],
-    #         **shared_configs
-    #     },
-    #     # memory_profile_config = {
-    #     #     'result_file_path': os.path.join('./profile_results/memory_profile.pickle'),
-    #     #     'num_iters': 5
-    #     # },
-    #     runtime_profile_config = {
-    #         'num_warmups': 5,
-    #         'num_trials': 20
-    #     },
-    #     mix_precision_config={
-    #         'enable': False,
-    #         'dtype': 'float16'
-    #     },
-    #     optimizer_config={
-    #         'lr': 1e-3
-    #     },
-    # )
+    model_benchmark(
+        with_backward=True,
+        model_config= {
+            'name': 'BasicsTransformerLM',
+            'device': 'cuda',
+            'torch_compile': True,
+            **test_configs['small'],
+            **shared_configs
+        },
+        # memory_profile_config = {
+        #     'result_file_path': os.path.join('./profile_results/memory_profile.pickle'),
+        #     'num_iters': 5
+        # },
+        runtime_profile_config = {
+            'num_warmups': 5,
+            'num_trials': 20
+        },
+        mix_precision_config={
+            'enable': False,
+            'dtype': 'float16'
+        },
+        optimizer_config={
+            'lr': 1e-3
+        },
+    )
 
     # test_compiled_llm()
 
-    test_simple_attention_layer()
+    # test_simple_attention_layer()

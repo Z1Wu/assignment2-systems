@@ -24,13 +24,13 @@ def weighted_sum_fwd(
     # Block pointers give us a way to select from an ND region of memory
     # and move our selection around.
     # The block pointer must know:
-    #- The pointer to the first element of the tensor
-    #- The overall shape of the tensor to handle out-of-bounds access
+    # - The pointer to the first element of the tensor
+    # - The overall shape of the tensor to handle out-of-bounds access
 
-    #- The strides of each dimension to use the memory layout properly
-    #- The ND coordinates of the starting block, i.e., "offsets"
-    #- The block shape to use load/store at a time
-    #- The order of the dimensions in memory from major to minor
+    # - The strides of each dimension to use the memory layout properly
+    # - The ND coordinates of the starting block, i.e., "offsets"
+    # - The block shape to use load/store at a time
+    # - The order of the dimensions in memory from major to minor
     #   axes (=np.argsort(strides))for optimizations,especially useful on H100
     x_block_ptr = tl.make_block_ptr(
         x_ptr,
@@ -283,6 +283,6 @@ if __name__ == "__main__":
     print(x, weight)
     print(f'gt: {weighted_sum(x, weight)}')
     triton_weightedsum = WeightedSumFunc.apply
-    out = triton_weightedsum(x, weight)
+    out = triton_weightedsum(x, weight).backward(torch.ones((1)).cuda()) # type: ignore
     print(f'gt: {out}')
     
