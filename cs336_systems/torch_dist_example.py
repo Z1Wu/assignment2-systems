@@ -137,8 +137,9 @@ def naive_ddp_func(rank, world_size, backend_type, train_x_path, train_y_path):
                 waitable_result = dist.all_reduce(
                     parm.grad,
                     op=dist.ReduceOp.SUM,
-                    async_op=True
+                    async_op=False
                 )
+                # if using async op = True, we need to wait aysnc op to finish here
                 if waitable_result != None:
                     waitable_result.wait()
                 print(f'[iter {i}][rank {rank}] after: {parm.grad}')
