@@ -76,7 +76,7 @@ def benchmark_dp(rank, config: dict, out: dict):
 class testModule(torch.nn.Module):
     def __init__(self, dim: int) -> None:
         super().__init__()
-        self.w = torch.nn.Linear(dim, 1)
+        self.w = torch.nn.Linear(dim, 1, bias=False)
         torch.nn.init.zeros_(self.w.weight)
     
     def forward(self, x):
@@ -105,9 +105,8 @@ def naive_ddp_func(rank, world_size, backend_type, train_x_path, train_y_path):
     gt_model =  testModule(train_x_dim).to(device)
 
     # before trainig start
-    # all rank should have same 
+    # all rank should have same parameters
     check_sample_param(ddp_model, gt_model)
-
 
     # Optimizer for the DDP model
     ddp_optimizer = optim.SGD(ddp_model.parameters(), lr=0.1)
@@ -116,6 +115,8 @@ def naive_ddp_func(rank, world_size, backend_type, train_x_path, train_y_path):
 
 
     for i in range(num_iter):
+        if rank == 0:
+            print(f'[iter {i}] running ...')
         ddp_optimizer.zero_grad()
         non_parallel_optimizer.zero_grad()
         # ddp model forward and backward
@@ -127,15 +128,20 @@ def naive_ddp_func(rank, world_size, backend_type, train_x_path, train_y_path):
         # mse error
         loss = torch.nn.functional.mse_loss(ddp_out, ddp_y)
         loss.backward()
+        print(f'[iter {i}][rank {rank}] {list(ddp_model.parameters())}')
 
         # reduce all gridient
         for parm in ddp_model.parameters():
             if parm.requires_grad and parm.grad != None:
-                dist.all_reduce(
+                print(f'[iter {i}][rank {rank}] before: {parm.grad}')
+                waitable_result = dist.all_reduce(
                     parm.grad,
                     op=dist.ReduceOp.SUM,
                     async_op=True
                 )
+                if waitable_result != None:
+                    waitable_result.wait()
+                print(f'[iter {i}][rank {rank}] after: {parm.grad}')
                 parm.grad /= world_size
         ddp_optimizer.step()
 
@@ -149,19 +155,19 @@ def naive_ddp_func(rank, world_size, backend_type, train_x_path, train_y_path):
 
 def naive_ddp_test():
     dataset_dir = '/home/wuzy/my_code/cs336/assignment2-systems/debug'
+    world_size = 2
+    backend_type = 'gloo'
     sample_num = 16
     data_dim = 64
     x = torch.randn(sample_num, data_dim)
-    y = torch.tensor([[i % 2 for i in range(sample_num)]]).view(sample_num, 1)
+    y = torch.tensor([[i % 2 for i in range(sample_num)]], dtype=torch.float32).view(sample_num, 1)
     train_x_path = os.path.join(dataset_dir, 'train_x.pt')
     train_y_path = os.path.join(dataset_dir, 'train_y.pt')
     torch.save(x, train_x_path)
     torch.save(y, train_y_path)
-    
-    
-    pass
+    mp.spawn(fn=naive_ddp_func, args=(world_size, backend_type, train_x_path, train_y_path), nprocs=world_size, join=True) # type: ignore
 
-def main():
+def naive_mp_benchmark():
     C_MB = 1024 * 1024
     # cpu + gloo or gpu + nccl
     backend_type_list = ['cpu']
@@ -198,6 +204,7 @@ def main():
         json.dump(result_list, f)
 
 if __name__ == "__main__":
-    main()
+    # naive_mp_benchmark()
+    naive_ddp_test()
 
     
