@@ -10,8 +10,12 @@ from torch import nn
 from typing import List, Type, Any
 from copy import deepcopy
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+import logging
+import json
 
-
+import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.getLogger().setLevel(logging.INFO)
 
 class Bucket:
     def __init__(self) -> None:
@@ -24,9 +28,9 @@ class Bucket:
     def __str__(self) -> str:
         return f"""
 [
-{self.param_names}
-{self.params_data}
-{self.cur_bucket_size}
+parm_names: {self.param_names},
+parm_data: {self.params_data},
+current_bucket_size: {self.cur_bucket_size}
 ]"""
 
 class DDP(nn.Module):
@@ -43,46 +47,54 @@ class DDP(nn.Module):
         optimizer.step()
     """
     
-    def __init__(self, model: nn.Module, bucket_size: int = 0) -> None:
+    def __init__(self, module: nn.Module, bucket_size_byte: int = 0, is_flat:bool = True) -> None:
         super().__init__()
         # 1. broadcast parameter to all device, make sure module on all deivces have same init state
-        self.original_model = model
+        self.module = module
 
         # FIXME only cares about parameters here, maybe need to consider buffer in module as well
         # run all reduce on model params
         # model.parameters() is stricted ordered
-        params = [p.data for p in model.parameters()]
+        params = [p.data for p in module.parameters()]
         new_params = self._broadcast_params_one_time(params)
-        for p, new_val in zip(model.parameters(), new_params):
+        for p, new_val in zip(module.parameters(), new_params):
             p.data.copy_(new_val)
 
         self.buckets: List[Bucket] = []
-        self.bucket_size = bucket_size
+        self.bucket_size = bucket_size_byte
         self.total_hook_count = 0
         self.hook_invoke_count = 0
-        for name, params in model.named_parameters():
-            if params.requires_grad:
-                print(f"register grident hook for {name}")
-                self.total_hook_count += 1
-                params.register_post_accumulate_grad_hook(
-                    self._prams_grad_hook_builder(name)
-                )
+        self.is_flat = is_flat
+        # negative number mean not 
+        if bucket_size_byte >= 0:
+            assert self.is_flat == True, 'computation and communication overlapping only run with flatted mode'
+            for name, params in module.named_parameters():
+                if params.requires_grad:
+                    logging.debug(f"register grident hook for {name}")
+                    self.total_hook_count += 1
+                    params.register_post_accumulate_grad_hook(
+                        self._prams_grad_hook_builder(name)
+                    )
             
     def _prams_grad_hook_builder(self, parm_name):
         def func(params: nn.Parameter):
             if len(self.buckets) == 0:
                 self.buckets.append(Bucket())
             assert params.grad != None
-            self.hook_invoke_count -= 1
+            self.hook_invoke_count += 1
             cur_bucket = self.buckets[-1]
             cur_bucket.param_names.append(parm_name)
             cur_bucket.params_data.append(params.grad.data)
             cur_bucket.cur_bucket_size += params.grad.nelement() * params.grad.dtype.itemsize
-            print(f"grident hook for {parm_name} invoked with bucket {cur_bucket}")
+            logging.debug(f"grident hook for {parm_name} invoked with bucket {cur_bucket}")
             # bucket size exceed or final hook invoked
             if cur_bucket.cur_bucket_size >= self.bucket_size or self.hook_invoke_count == self.total_hook_count:
                 # communicate current bucket
-                print(f"launch communication for bucket")
+                # logging.info(f"[{dist.get_rank()}]: launch communication for bucket with size: {cur_bucket.cur_bucket_size}  \
+                #              , expected bucket size: {self.bucket_size} \
+                #              , total_hook_count: {self.total_hook_count} \
+                #              , self.hook_invoke_count: {self.hook_invoke_count} \
+                #              ")
                 cur_bucket.flatten_tensor = _flatten_dense_tensors(cur_bucket.params_data)
                 cur_bucket.handle = dist.all_reduce(
                     cur_bucket.flatten_tensor,
@@ -92,7 +104,6 @@ class DDP(nn.Module):
         return func
 
     def _broadcast_params_one_time(self, params: List[torch.Tensor]):
-        from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
         # no zero copy view, a new copied contiguous
         flatted_tensor = _flatten_dense_tensors(params)
         dist.broadcast(
@@ -108,25 +119,67 @@ class DDP(nn.Module):
 
     def forward(self, *inputs, **kwargs):
         # dispatch call to underly module
-        return self.original_model(*inputs, **kwargs)
+        return self.module(*inputs, **kwargs)
 
     def finish_gradient_synchronization(self): 
+        if self.bucket_size < 0:
+            logging.debug("run with naive gradient_synchronization")
+            self._finish_gradient_synchronization_naive()
+            return
+        logging.debug(f"run with overlapping gradient_synchronization, wait synchronization finish with buckets handle")
+        cnt = 0
         for bucket in self.buckets:
+            logging.debug(f'bucket {bucket} with handle {bucket.handle}')
             if bucket.handle != None:
-                print("wait graident commnunication finsih")
+                logging.debug("wait graident commnunication finsih")
+                cnt += 1
                 bucket.handle.wait()
                 new_data = _unflatten_dense_tensors(bucket.flatten_tensor, bucket.params_data)
                 for name, new_val in zip(bucket.param_names, new_data):
-                    param = self.original_model.get_parameter(name)
+                    param = self.module.get_parameter(name)
                     assert param.grad != None
-                    print(f"update gradient for {name} \n old val {param.grad.data} \n new val {new_val / dist.get_world_size()}")
+                    logging.debug(f"update gradient for {name} \n old val {param.grad.data} \n new val {new_val / dist.get_world_size()}")
                     param.grad.data.copy_(
                         # average grident
                         new_val / dist.get_world_size()
                     )
+        logging.info(f'[{dist.get_rank()}] finish get resutlt with [{cnt}] buckets.')
         # clear buckets, reset counter
         self.buckets = []
         self.hook_invoke_count = 0
+
+    def _finish_gradient_synchronization_naive(self):
+        if self.is_flat:
+            params_data = [param.grad.data for param in self.module.parameters() if param.requires_grad and  param.grad != None]
+            flatted_tensor = _flatten_dense_tensors(params_data)
+            dist.reduce(
+                flatted_tensor,
+                
+                async_op=False # use sync op here, reduce with sum op by default
+            )
+            new_params_data = _unflatten_dense_tensors(
+                flatted_tensor,
+                params_data
+            )
+            for p, new_val in zip(
+                [param for param in self.module.parameters() if param.requires_grad and param.grad != None], 
+                new_params_data
+            ):
+                p.data.copy_(new_val )
+        else:
+            for parm in self.module.parameters():
+                if parm.requires_grad and parm.grad != None:
+                    logging.debug(f'before: {parm.grad}')
+                    waitable_result = dist.all_reduce(
+                        parm.grad,
+                        op=dist.ReduceOp.SUM,
+                        async_op=True
+                    )
+                    # if using async op = True, we need to wait aysnc op to finish here
+                    if waitable_result != None:
+                        waitable_result.wait()
+                    logging.debug(f'after: {parm.grad}')
+                    parm.grad /= dist.get_world_size()
 
 
 def setup(rank, world_size, backend_type):
@@ -170,7 +223,7 @@ def benchmark_dp(rank, config: dict, out: dict):
         dist.all_gather(duration_ms_list, duration_ms, )
         if rank == 0:
             # only print result on first rank
-            # print('benchmark result:', duration_ms_list[0])
+            logging.debug('benchmark result:', duration_ms_list[0])
             return torch.mean(duration_ms_list[0]).cpu().item()
         else:
             return 0
@@ -210,7 +263,9 @@ def check_sample_param(m1: torch.nn.Module, m2: torch.nn.Module):
         ):
             assert torch.allclose(non_parallel_model_parameter, ddp_model_parameter)
 
-def naive_ddp_func(rank, world_size, model_class, backend_type, train_x_path, train_y_path):
+def naive_ddp_func(
+        rank, world_size, model_class, backend_type, train_x_path, train_y_path,  
+        out_file_path, num_iter = 1, bucket_size: int = 0, is_flat = True):
     from torch import optim
     setup(rank=rank, world_size=world_size, backend_type=backend_type)
 
@@ -221,11 +276,9 @@ def naive_ddp_func(rank, world_size, model_class, backend_type, train_x_path, tr
     # currently no mulitple gpu support, running with cpu and gloo for testing
     device = torch.device('cpu')
     
-    num_iter = 4
-    # init 一致的话，需要把参数传递到其他 rank 的 model 上
     gt_model =  model_class().to(device)
     ddp_model = deepcopy(gt_model)
-    ddp_model = DDP(ddp_model)
+    ddp_model = DDP(ddp_model, bucket_size, is_flat)
 
     # before trainig start
     # rank zero show have ddp_model and gt_model with same parameters for testing
@@ -242,10 +295,10 @@ def naive_ddp_func(rank, world_size, model_class, backend_type, train_x_path, tr
     import time
     # benchmark
     for i in range(num_iter):
-        if rank == 0:
-            print(f'[iter {i}] running ...')
         log_prefix = f'[iter {i}][rank {rank}]'
-        start = time.time() 
+        if rank == 0:
+            logging.info(f'{log_prefix} running ...')
+        start = time.time()
         ddp_optimizer.zero_grad()
         non_parallel_optimizer.zero_grad()
         # ddp model forward and backward
@@ -259,22 +312,9 @@ def naive_ddp_func(rank, world_size, model_class, backend_type, train_x_path, tr
         finish_forward = time.time()
         loss.backward()
         finish_backward = time.time()
-        print(f'{log_prefix} {list(ddp_model.parameters())}')
+        logging.debug(f'{log_prefix} {list(ddp_model.parameters())}')
 
         # reduce all gridient
-        # for parm in ddp_model.parameters():
-        #     if parm.requires_grad and parm.grad != None:
-        #         print(f'{log_prefix} before: {parm.grad}')
-        #         waitable_result = dist.all_reduce(
-        #             parm.grad,
-        #             op=dist.ReduceOp.SUM,
-        #             async_op=False
-        #         )
-        #         # if using async op = True, we need to wait aysnc op to finish here
-        #         if waitable_result != None:
-        #             waitable_result.wait()
-        #         print(f'{log_prefix} after: {parm.grad}')
-        #         parm.grad /= world_size
         ddp_model.finish_gradient_synchronization()
         finish_grident_comm = time.time()
         ddp_optimizer.step()
@@ -288,7 +328,7 @@ def naive_ddp_func(rank, world_size, model_class, backend_type, train_x_path, tr
                 'optim_step_time': finish_optim_update - finish_grident_comm
             }
         )
-        print(f'{log_prefix}: {sub_proc_times[-1]}')
+        logging.info(f'{log_prefix}: {sub_proc_times[-1]}')
         # only run in rank 0
         if rank == 0:
             base_out = gt_model(train_x)
@@ -298,9 +338,19 @@ def naive_ddp_func(rank, world_size, model_class, backend_type, train_x_path, tr
 
             # for all rank, non_parallel_optimizer should have same model
             check_sample_param(ddp_model, gt_model)
+    if rank == 0:
+        # reduce reuslt and save to file
+        out = {'iter_num': num_iter}
+        for i in range(num_iter):
+            for k, v in sub_proc_times[i].items():
+                if k not in out:
+                    out[k] = 0
+                out[k] += (v / num_iter)
+        with open(out_file_path, 'w') as f:
+            json.dump(out, f)
+            
 
 class FactoryProvider:
-    # 
     def __init__(self, model_class: Type[nn.Module], *args, **kwargs) -> None:
         self.model_class = model_class
         self.args = args
@@ -315,31 +365,60 @@ def naive_ddp_test():
     world_size = 2
     backend_type = 'gloo'
     sample_num = 16
-    tiny_config = {
-        'vocab_size': 1000,
-        'context_length': 64,
-        'd_model': 64,
-        'num_layers': 2,
-        'num_heads': 4,
-        'd_ff': 256,  # d_model * 4
-    }
+    out_dir = './profile_results'
+    
     train_data_shape = [64]
     train_data_dtype = torch.float32
     train_label_shape = [1]
     train_label_dtype = torch.float32
-    model_class = FactoryProvider(testModule, train_data_shape[0])
-    # model_class = lambda : BasicsTransformerLM(
-    #     **tiny_config
-    # )
-    # 创建测试的训练数据
-    
     x = torch.randn(sample_num, *train_data_shape, dtype=train_data_dtype)
     y = torch.randn(sample_num, *train_label_shape, dtype=train_label_dtype)
+    model_class = FactoryProvider(testModule, train_data_shape[0])
+
+    # model_config = {
+    #     'vocab_size': 1000,
+    #     'context_length': 64,
+    #     'd_model': 64,
+    #     'num_layers': 2,
+    #     'num_heads': 4,
+    #     'd_ff': 256,  # d_model * 4
+    # }
+    # x = torch.randint(
+    #     0, 
+    #     model_config['vocab_size'],
+    #     [sample_num, model_config['context_length']]
+    # )
+    # y = torch.randint(
+    #     0, 
+    #     model_config['vocab_size'],
+    #     [sample_num, model_config['context_length']]
+    # )
+    # model_class = FactoryProvider(BasicsTransformerLM, **model_config)
     train_x_path = os.path.join(dataset_dir, 'train_x.pt')
     train_y_path = os.path.join(dataset_dir, 'train_y.pt')
+
     torch.save(x, train_x_path)
     torch.save(y, train_y_path)
-    mp.spawn(fn=naive_ddp_func, args=(world_size, model_class, backend_type, train_x_path, train_y_path), nprocs=world_size, join=True) # type: ignore
+    for i, (bucket_size, is_flated)  in enumerate([
+        # (-1, False),
+        # (-1, True),
+        # (0, True),
+        (10 * 1024 * 1024, True), # 10 M bucket size
+        # (100 * 1024 * 1024, True), # 10 M bucket size
+    ]):
+        mp.spawn(fn=naive_ddp_func, args=(  # type: ignore
+            world_size, 
+            model_class, 
+            backend_type, 
+            train_x_path, 
+            train_y_path,
+            os.path.join(out_dir, f'{i}.json'), # out file path
+            1, # num_iter
+            bucket_size, # bucket_size
+            is_flated # is_flat
+        ), 
+        nprocs=world_size, join=True
+    )
 
 def naive_mp_benchmark():
     C_MB = 1024 * 1024
