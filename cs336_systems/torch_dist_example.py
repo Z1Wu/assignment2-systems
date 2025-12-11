@@ -7,11 +7,13 @@ from datetime import datetime
 from multiprocessing import Manager
 from cs336_basics.model import BasicsTransformerLM
 from torch import nn
-from typing import List, Type, Any
+from typing import List, Type, Any, Iterable
 from copy import deepcopy
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 import logging
 import json
+from torch.optim import Optimizer
+from collections import defaultdict
 
 import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -182,6 +184,100 @@ class DDP(nn.Module):
                     parm.grad /= dist.get_world_size()
 
 
+class ShardedOptimizer(Optimizer):
+    def __init__(self,params, optimizer_cls:Type[Optimizer], **kwargs:Any):
+        # kwargs should include parameters
+        assert 'params' in kwargs, 'invalid arguments, should pass `params` with type `Iterable[torch.nn.parameter.Parameter]`'
+        self.params:Iterable[torch.nn.parameter.Parameter] = kwargs['params']
+        self.rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
+        del kwargs['params']
+
+        # 最简单的场景，传入的  params 就是一个 Iterable[torch.nn.parameter.Parameter]
+        # 1. 一个 torch.nn.parameter.Parameter List（本质是 Tensor List）
+        # 2. 多个 params group (dict 和 tuple 实际是相同的场景) 
+
+        # Union[
+        #     Iterable[torch.Tensor], 
+        #     Iterable[Dict[str, Any]], 
+        #     Iterable[Tuple[str, torch.Tensor]]
+        # ]
+        # rank -> self.params 
+        self.rank2params = [[] for _ in range(self.world_size)]
+        
+        self.internal_optimizer = optimizer_cls(params=params, **kwargs) # type: ignore
+        # 控制每个 rank 只持有一部分 params 
+        super().__init__(**kwargs)
+
+
+    def _broadcast_params_one_time(self, params: List[torch.Tensor]):
+        # no zero copy view, a new copied contiguous
+        flatted_tensor = _flatten_dense_tensors(params)
+        handle = dist.broadcast(
+            flatted_tensor,
+            src=0,
+            async_op=False
+        )
+        return handle, _unflatten_dense_tensors(
+            flatted_tensor,
+            params
+        )
+    
+    def step(self, closure, **kwargs):
+        # 此处需要调用内部的 optimizer 的 step 更新 parameters
+        self.internal_optimizer.step(closure, **kwargs)
+        # 把更新后的 params 同步到所有的 rank
+        handles = []
+        for idx in range(self.world_size):
+            params = [p.data for p in self.rank2params[idx]]
+            handle, new_params = self._broadcast_params_one_time(params)
+            for p, new_val in zip(self.rank2params[idx], new_params):
+                p.data.copy_(new_val)
+            handles.append(handle)
+        for handle in handles:
+            assert handle != None, 'run with async gradients'
+            handle.wait() 
+
+    def add_param_group(self, param_group:dict[str,Any]):
+        # 底层持有的参数
+        if not isinstance(param_group, dict):
+            raise TypeError(f"param_group must be a dict, but got {type(param_group)}")
+        
+        # 在此处完成所有的拆分，每个 rank 把需要更新的 params 传入其内部的 params_group
+        params = param_group["params"]
+        if isinstance(params, torch.Tensor):
+            param_group["params"] = [params]
+        elif isinstance(params, set):
+            raise TypeError(
+                "optimizer parameters need to be organized in ordered collections, but "
+                "the ordering of tensors in sets will change between runs. Please use a list instead."
+            )
+        else:
+            param_group["params"] = list(params)
+
+        current_size = 0
+        idx = 0
+        total_size = 0
+        # only support this for now
+        for param in param_group["params"]:
+            if not isinstance(param, torch.Tensor):
+                raise TypeError(
+                    "optimizer can only optimize Tensors, "
+                    "but one of the params is " + torch.typename(param)
+                )
+            total_bytes += param.numel()
+        
+        target_rank_size = total_size // self.world_size
+        for param in param_group["params"]:
+            current_size += param.numel()
+            # 此处记录的是引用
+            self.rank2params[idx].append(param)
+            if current_size >= (idx + 1) * target_rank_size:
+                idx += 1
+        param_group["params"] = self.rank2params[self.rank]
+        self.internal_optimizer.add_param_group(param_group=param_group)
+
+
 def setup(rank, world_size, backend_type):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29500"
@@ -348,7 +444,6 @@ def naive_ddp_func(
                 out[k] += (v / num_iter)
         with open(out_file_path, 'w') as f:
             json.dump(out, f)
-            
 
 class FactoryProvider:
     def __init__(self, model_class: Type[nn.Module], *args, **kwargs) -> None:
@@ -366,14 +461,14 @@ def naive_ddp_test():
     backend_type = 'gloo'
     sample_num = 16
     out_dir = './profile_results'
-    
-    train_data_shape = [64]
-    train_data_dtype = torch.float32
-    train_label_shape = [1]
-    train_label_dtype = torch.float32
-    x = torch.randn(sample_num, *train_data_shape, dtype=train_data_dtype)
-    y = torch.randn(sample_num, *train_label_shape, dtype=train_label_dtype)
-    model_class = FactoryProvider(testModule, train_data_shape[0])
+
+    # train_data_shape = [64]
+    # train_data_dtype = torch.float32
+    # train_label_shape = [1]
+    # train_label_dtype = torch.float32
+    # x = torch.randn(sample_num, *train_data_shape, dtype=train_data_dtype)
+    # y = torch.randn(sample_num, *train_label_shape, dtype=train_label_dtype)
+    # model_class = FactoryProvider(testModule, train_data_shape[0])
 
     # model_config = {
     #     'vocab_size': 1000,
@@ -382,18 +477,27 @@ def naive_ddp_test():
     #     'num_layers': 2,
     #     'num_heads': 4,
     #     'd_ff': 256,  # d_model * 4
+    #     'rope_theta': 1000
     # }
-    # x = torch.randint(
-    #     0, 
-    #     model_config['vocab_size'],
-    #     [sample_num, model_config['context_length']]
-    # )
-    # y = torch.randint(
-    #     0, 
-    #     model_config['vocab_size'],
-    #     [sample_num, model_config['context_length']]
-    # )
-    # model_class = FactoryProvider(BasicsTransformerLM, **model_config)
+    model_config = {
+        "name": "transformer_xl_base",
+        "vocab_size": 267_735,
+        "context_length": 512,
+        "d_model": 512,
+        "num_layers": 12,
+        "num_heads": 8,
+        "d_ff": 2048
+    }
+
+    x = torch.randint(
+        0, 
+        model_config['vocab_size'],
+        [sample_num, model_config['context_length']]
+    )
+    y = torch.randn(
+        [sample_num, model_config['context_length'], model_config['vocab_size']]
+    )
+    model_class = FactoryProvider(BasicsTransformerLM, **model_config)
     train_x_path = os.path.join(dataset_dir, 'train_x.pt')
     train_y_path = os.path.join(dataset_dir, 'train_y.pt')
 
@@ -403,21 +507,22 @@ def naive_ddp_test():
         # (-1, False),
         # (-1, True),
         # (0, True),
-        (10 * 1024 * 1024, True), # 10 M bucket size
+        (100 * 1024 * 1024, True), # 100 M bucket size
         # (100 * 1024 * 1024, True), # 10 M bucket size
     ]):
-        mp.spawn(fn=naive_ddp_func, args=(  # type: ignore
-            world_size, 
-            model_class, 
-            backend_type, 
-            train_x_path, 
+        mp.spawn(fn=naive_ddp_func, args=( # type: ignore
+            world_size,
+            model_class,
+            backend_type,
+            train_x_path,
             train_y_path,
             os.path.join(out_dir, f'{i}.json'), # out file path
             1, # num_iter
             bucket_size, # bucket_size
             is_flated # is_flat
-        ), 
-        nprocs=world_size, join=True
+        ),
+        nprocs=world_size,
+        join=True
     )
 
 def naive_mp_benchmark():
