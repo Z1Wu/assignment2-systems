@@ -98,7 +98,6 @@ def get_ddp_bucketed(module: torch.nn.Module, bucket_size_mb: float) -> torch.nn
     return DDP(module = module, bucket_size_byte = int(bucket_size_mb * 1024 * 1024))
 
 
-
 def ddp_bucketed_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
     """
     Code to run after the backward pass is completed, but before we take
@@ -145,4 +144,5 @@ def get_sharded_optimizer(params, optimizer_cls: Type[torch.optim.Optimizer], **
     Returns:
         Instance of sharded optimizer.
     """
-    raise NotImplementedError
+    from cs336_systems.torch_dist_example import ShardedOptimizer
+    return ShardedOptimizer(params, optimizer_cls, **kwargs)

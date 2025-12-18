@@ -14,6 +14,7 @@ import logging
 import json
 from torch.optim import Optimizer
 from collections import defaultdict
+import numpy
 
 import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -205,7 +206,7 @@ class ShardedOptimizer(Optimizer):
         t_rank2prams = self._divide_params(self.params)
         for i, v in enumerate(t_rank2prams):
             self.rank2params[i].extend(v)
-        logging.info(f'prams for rank {self.rank} : {self.rank2params[self.rank]}')
+        logging.debug(f'prams for rank {self.rank} : {self.rank2params[self.rank]}')
         if len(self.rank2params[self.rank]) > 0:
             self.internal_optimizer = optimizer_cls(params=self.rank2params[self.rank], **kwargs)
             # empty parameters
@@ -235,12 +236,12 @@ class ShardedOptimizer(Optimizer):
     
     def step(self, closure = None, **kwargs):
         # 此处需要调用内部的 optimizer 的 step 更新 parameters
+        logging.debug(f'[before-step] prams for rank {self.rank} : {self.rank2params[self.rank]}')
         self.internal_optimizer.step(closure, **kwargs)
         pack = []
         for idx in range(self.world_size):
             params = [p.data for p in self.rank2params[idx]]
             # 把更新后的 params 同步到所有的 rank
-            # handle, new_params = self._broadcast_params_one_time(params)
             flatted_tensor = _flatten_dense_tensors(params)
             handle = dist.broadcast(
                 flatted_tensor,
@@ -257,8 +258,16 @@ class ShardedOptimizer(Optimizer):
             )
             for p, new_val in zip(params, new_params):
                 p.data.copy_(new_val)
-        logging.debug(f'[step] prams for rank {self.rank} : {self.rank2params[self.rank]}')
+        logging.debug(f'[after-step] prams for rank {self.rank} : {self.rank2params[self.rank]}')
         
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        assert set_to_none == True, "only support set grad to None when run zero grad for now"
+        self.internal_optimizer.zero_grad(set_to_none)
+        for params in self.rank2params:
+            for param in params:
+                if param.grad is not None: # type: ignore
+                    param.grad = None # type: ignore
+        return super().zero_grad(set_to_none)
 
     def add_param_group(self, param_group:dict[str,Any]):
         if not isinstance(param_group, dict):
@@ -358,14 +367,16 @@ class testModule(torch.nn.Module):
         return torch.nn.functional.sigmoid(self.w1(x) + self.w(x))
 
 def check_sample_param(m1: torch.nn.Module, m2: torch.nn.Module):
-    for non_parallel_model_parameter, ddp_model_parameter in zip(
-            m1.parameters(), m2.parameters()
-        ):
-            assert torch.allclose(non_parallel_model_parameter, ddp_model_parameter)
+    for non_sharded_parameters, sharded_parameters in zip(m1.parameters(), m2.parameters()):
+        numpy.testing.assert_allclose(
+            non_sharded_parameters.detach().cpu().numpy(),
+            sharded_parameters.detach().cpu().numpy(),
+            rtol=1e-4
+        )
 
 def naive_ddp_func(
         rank, world_size, model_class, backend_type, train_x_path, train_y_path,  
-        out_file_path, num_iter = 1, bucket_size: int = 0, is_flat = True, optim_sharded = False):
+        out_file_path, num_iter = 1, bucket_size: int = 0, is_flat = True, optim_sharded = False, enable_ddp = False):
     from torch import optim
     setup(rank=rank, world_size=world_size, backend_type=backend_type)
 
@@ -378,7 +389,7 @@ def naive_ddp_func(
     
     gt_model =  model_class().to(device)
     ddp_model = deepcopy(gt_model)
-    ddp_model = DDP(ddp_model, bucket_size, is_flat)
+    ddp_model = DDP(ddp_model, bucket_size, is_flat)        
 
     # before trainig start
     # rank zero show have ddp_model and gt_model with same parameters for testing
@@ -405,6 +416,11 @@ def naive_ddp_func(
         start = time.time()
         ddp_optimizer.zero_grad()
         non_parallel_optimizer.zero_grad()
+        if rank == 0:
+            for name, param in ddp_model.named_parameters():
+                logging.debug(f"[ddp] [{rank}] {name} \n params: {param.data} \n grad: {param.grad}")
+            for name, param in gt_model.named_parameters():
+                logging.debug(f"[base] [{rank}] {name} \n params: {param.data} \n grad: {param.grad}")
         # ddp model forward and backward
         batch_size_per_device = sample_num // world_size
         # shape: batch_size_per_device, dim
@@ -437,11 +453,14 @@ def naive_ddp_func(
         if rank == 0:
             base_out = gt_model(train_x)
             base_loss = torch.nn.functional.mse_loss(base_out, train_y)
-            base_loss.backward()        
+            base_loss.backward()
+            # for name, param in gt_model.named_parameters():
+            #     logging.info(f"[base] {rank}] grad for {name} params: {param.data} \n grad: {param.grad}")
             non_parallel_optimizer.step()
 
             # for all rank, non_parallel_optimizer should have same model
             check_sample_param(ddp_model, gt_model)
+            logging.info(f'finish iter [{i}]')
     if rank == 0:
         # reduce reuslt and save to file
         out = {'iter_num': num_iter}
@@ -469,9 +488,10 @@ def naive_ddp_test():
     backend_type = 'gloo'
     sample_num = 16
     out_dir = './profile_results'
+    torch.manual_seed(42)
 
     # for smoke test
-    train_data_shape = [64]
+    train_data_shape = [8]
     train_data_dtype = torch.float32
     train_label_shape = [1]
     train_label_dtype = torch.float32
@@ -513,7 +533,7 @@ def naive_ddp_test():
 
     torch.save(x, train_x_path)
     torch.save(y, train_y_path)
-    for i, (bucket_size, is_flated, optim_sharded)  in enumerate([
+    for i, (bucket_size, is_flat, optim_sharded)  in enumerate([
         (-1, False, True),
         # (-1, True),
         # (0, True),
@@ -528,10 +548,11 @@ def naive_ddp_test():
             train_x_path,
             train_y_path,
             os.path.join(out_dir, f'{i}.json'), # out file path
-            1, # num_iter
+            5, # num_iter
             bucket_size, # bucket_size
-            is_flated, # is_flat
-            optim_sharded # 是否使用 sharded 的 optimizer
+            is_flat, # is_flat
+            optim_sharded, # enable sharded optimizer 
+            False # enable ddp
         ),
         nprocs=world_size,
         join=True
